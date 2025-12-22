@@ -1,0 +1,14 @@
+runs/*
+runs-*/
+*.log
+*.tmp
+.cache/
+.vscode/
+.DS_Store
+node_modules/
+dist/
+.env
+coverage/
+.idea/
+wandb/
+.ipynb_checkpoints/
