@@ -12,3 +12,8 @@ coverage/
 .idea/
 wandb/
 .ipynb_checkpoints/
+data/
+models/
+runs/
+__pycache__/
+data
