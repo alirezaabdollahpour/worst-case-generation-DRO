@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 
@@ -81,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=1)
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--log_every", type=int, default=50)
+    p.add_argument("--metrics_every", type=int, default=50, help="Write metrics JSON every N steps.")
+    p.add_argument("--metrics_file", type=str, default="metrics.json", help="Metrics JSON filename inside out_dir.")
     return p.parse_args()
 
 
@@ -164,6 +167,19 @@ def main() -> None:
     seed_everything(args.seed)
     out_dir = ensure_dir(args.out_dir)
     device = torch.device(args.device)
+    metrics_path = out_dir / args.metrics_file if args.metrics_file else None
+    metrics_rows: List[Dict[str, Any]] = []
+
+    def _write_metrics() -> None:
+        if metrics_path is None:
+            return
+        payload = {
+            "args": vars(args),
+            "metrics": metrics_rows,
+        }
+        tmp = metrics_path.with_suffix(metrics_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(metrics_path)
 
     vae, vae_ckpt = load_vae(args.vae_ckpt, device)
     theta0, clf_ckpt = load_classifier(args.clf_ckpt, device)
@@ -250,6 +266,10 @@ def main() -> None:
     assert m_prime <= m
 
     for k in tqdm(range(1, args.k_batches + 1), desc="minimax GDA"):
+        log_this = (k % args.log_every) == 0 or k == 1
+        metrics_this = (k % args.metrics_every) == 0 or k == 1
+        want_metrics = log_this or metrics_this
+
         idx = next(idx_iter).to(device)
 
         # ---- (1) Particle + classifier GDA update with momentum (Appendix B.2) ----
@@ -300,6 +320,7 @@ def main() -> None:
         v_s = v[idx_small].detach()
 
         match_loss_val: float
+        gn_omega: float = float("nan")
         use_adam_transport = (args.transport == "mlp") or ((args.transport == "icnn") and (not args.icnn_bb_armijo))
         if use_adam_transport:
             pred = transport(x_s, y_s)
@@ -309,6 +330,17 @@ def main() -> None:
             assert opt_transport is not None
             opt_transport.zero_grad(set_to_none=True)
             match_loss.backward()
+            if want_metrics:
+                gn = 0.0
+                wd = float(args.transport_wd)
+                for p in transport.parameters():
+                    if p.grad is None:
+                        continue
+                    g_p = p.grad.detach()
+                    if wd != 0.0:
+                        g_p = g_p + wd * p.detach()
+                    gn += float(g_p.pow(2).sum().cpu())
+                gn_omega = gn ** 0.5
             opt_transport.step()
         else:
             assert bb_state is not None
@@ -330,10 +362,10 @@ def main() -> None:
                     obj = obj - 0.5 * args.transport_wd * l2
                 return obj
 
-            _params, bb_state, _f0, _gn = bb_armijo_step_params_fn(transport.parameters(), f_params, bb_state)
+            _params, bb_state, _f0, gn_omega = bb_armijo_step_params_fn(transport.parameters(), f_params, bb_state)
 
         # ---- Logging / checkpointing ----
-        if (k % args.log_every) == 0 or k == 1:
+        if log_this:
             with torch.no_grad():
                 ce_mean = float(ce.mean().cpu())
                 m_loss = float(match_loss_val)
@@ -343,7 +375,25 @@ def main() -> None:
                     if p.grad is not None:
                         gn_theta += float((p.grad.detach() / m).pow(2).sum().cpu())
                 gn_theta = gn_theta ** 0.5
-            tqdm.write(f"[k={k:05d}] ce={ce_mean:.4f}  match={m_loss:.6f}  GN_theta={gn_theta:.4f}")
+            tqdm.write(
+                f"[k={k:05d}] ce={ce_mean:.4f}  match={m_loss:.6f}  GN_theta={gn_theta:.4f}  GN_omega={gn_omega:.4f}"
+            )
+
+        if metrics_this:
+            with torch.no_grad():
+                ce_mean = float(ce.mean().cpu())
+                gn_theta = 0.0
+                for p in theta.parameters():
+                    if p.grad is not None:
+                        gn_theta += float((p.grad.detach() / m).pow(2).sum().cpu())
+                gn_theta = gn_theta ** 0.5
+            metrics_rows.append({
+                "k": int(k),
+                "ce": float(ce_mean),
+                "match": float(match_loss_val),
+                "gn_theta": float(gn_theta),
+                "gn_omega": float(gn_omega),
+            })
 
         if (k % args.save_every) == 0 or k == args.k_batches:
             save_checkpoint(out_dir / f"minimax_step{k:06d}.pt", {
@@ -383,6 +433,7 @@ def main() -> None:
         "g": g.detach().cpu(),
         "h_params": [h.detach().cpu() for h in h_params],
     })
+    _write_metrics()
 
 
 if __name__ == "__main__":

@@ -191,4 +191,6 @@ def bb_armijo_step_params(
     grad_tensors_new = [g.detach() if g is not None else torch.zeros_like(p) for p, g in zip(params, grads_new)]
     grad_vec_new = nn_utils.parameters_to_vector(grad_tensors_new)
     new_state = bb_state.update_history(final_vec, grad_vec_new, alpha_k)
-    return params, new_state, f_val_float, grad_vec_new.norm().item()
+    # Return the gradient norm at the *start* of the step (matches typical logging),
+    # while BB history is still updated using the post-step gradient.
+    return params, new_state, f_val_float, grad_norm
