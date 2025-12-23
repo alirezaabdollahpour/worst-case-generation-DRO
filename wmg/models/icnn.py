@@ -237,7 +237,9 @@ class LabelConditionedICNNTransport(nn.Module):
             if self.potential.hidden_output.bias is not None:
                 self.potential.hidden_output.bias.zero_()
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor, *, create_graph: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y: torch.Tensor, *, create_graph: Optional[bool] = None) -> torch.Tensor:
+        if create_graph is None:
+            create_graph = bool(self.training)
         x_in = x.detach().requires_grad_(True)
         with torch.set_grad_enabled(True):
             ey = self.embed(y)

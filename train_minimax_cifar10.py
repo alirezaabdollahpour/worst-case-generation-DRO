@@ -62,6 +62,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--icnn_softplus_beta", type=float, default=20.0)
     p.add_argument("--icnn_no_identity_init", action="store_true",
                    help="Disable identity-like initialization for ICNN transport.")
+    p.add_argument(
+        "--icnn_bb_armijo",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use BB+Armijo line search for ICNN transport parameter updates. "
+            "If disabled, trains ICNN transport with Adam using --transport_lr/--transport_wd (same as MLP)."
+        ),
+    )
     p.add_argument("--icnn_alpha0", type=float, default=1e-1)
     p.add_argument("--icnn_alpha_min", type=float, default=1e-6)
     p.add_argument("--icnn_alpha_max", type=float, default=10.0)
@@ -191,6 +200,7 @@ def main() -> None:
     # Transport map T_φ(x,y): residual MLP with label embedding; initialized as identity (Appendix B.2).
     opt_transport = None
     bb_state = None
+    bb_armijo_step_params_fn = None
     if args.transport == "mlp":
         tcfg = TransportConfig(latent_dim=d, hidden_width=512, num_classes=10, label_embed_dim=512)
         transport = LabelConditionedTransport(tcfg).to(device)
@@ -198,7 +208,6 @@ def main() -> None:
         transport_cfg_dict: Dict[str, Any] = tcfg.__dict__
     else:
         from wmg.models.icnn import LabelConditionedICNNTransport, ICNNTransportConfig
-        from wmg.utils.BB_Armijo import BBArmijoState, bb_armijo_step_params
 
         hidden_sizes = _parse_hidden_sizes(args.icnn_hidden_sizes)
         icfg = ICNNTransportConfig(
@@ -213,14 +222,20 @@ def main() -> None:
             identity_init=not args.icnn_no_identity_init,
         )
         transport = LabelConditionedICNNTransport(icfg).to(device)
-        bb_state = BBArmijoState.create(
-            alpha0=args.icnn_alpha0,
-            alpha_min=args.icnn_alpha_min,
-            alpha_max=args.icnn_alpha_max,
-            ls_c=args.icnn_ls_c,
-            ls_shrink=args.icnn_ls_shrink,
-            ls_max_steps=args.icnn_ls_max_steps,
-        )
+        if args.icnn_bb_armijo:
+            from wmg.utils.BB_Armijo import BBArmijoState, bb_armijo_step_params
+
+            bb_armijo_step_params_fn = bb_armijo_step_params
+            bb_state = BBArmijoState.create(
+                alpha0=args.icnn_alpha0,
+                alpha_min=args.icnn_alpha_min,
+                alpha_max=args.icnn_alpha_max,
+                ls_c=args.icnn_ls_c,
+                ls_shrink=args.icnn_ls_shrink,
+                ls_max_steps=args.icnn_ls_max_steps,
+            )
+        else:
+            opt_transport = Adam(transport.parameters(), lr=args.transport_lr, weight_decay=args.transport_wd)
         transport_cfg_dict = {**icfg.__dict__, "hidden_sizes": list(icfg.hidden_sizes)}
 
     # Momentum buffers for θ: h^0 = 0.
@@ -285,7 +300,8 @@ def main() -> None:
         v_s = v[idx_small].detach()
 
         match_loss_val: float
-        if args.transport == "mlp":
+        use_adam_transport = (args.transport == "mlp") or ((args.transport == "icnn") and (not args.icnn_bb_armijo))
+        if use_adam_transport:
             pred = transport(x_s, y_s)
             match_loss = ((pred - v_s) ** 2).mean()
             match_loss_val = float(match_loss.detach().cpu())
@@ -296,6 +312,7 @@ def main() -> None:
             opt_transport.step()
         else:
             assert bb_state is not None
+            assert bb_armijo_step_params_fn is not None
             match_loss_val = float("nan")
 
             def f_params(create_graph: bool) -> torch.Tensor:
@@ -313,7 +330,7 @@ def main() -> None:
                     obj = obj - 0.5 * args.transport_wd * l2
                 return obj
 
-            _params, bb_state, _f0, _gn = bb_armijo_step_params(transport.parameters(), f_params, bb_state)
+            _params, bb_state, _f0, _gn = bb_armijo_step_params_fn(transport.parameters(), f_params, bb_state)
 
         # ---- Logging / checkpointing ----
         if (k % args.log_every) == 0 or k == 1:
