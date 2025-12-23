@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from wmg.data.cifar10 import CIFAR10_CLASS_NAMES
+from wmg.data.cifar10 import cifar10_transform
 from wmg.models.vae import VAE, VAEConfig
 from wmg.models.classifier import MLPClassifier, ClassifierConfig
 from wmg.models.transport import LabelConditionedTransport, TransportConfig
@@ -35,10 +36,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def _normalize_to_minus1_1() -> transforms.Compose:
-    return transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda t: t * 2.0 - 1.0),
-    ])
+    # Keep a single canonical normalization across all scripts.
+    return cifar10_transform(normalize_to_minus1_1=True, augment=False)
+
+
+def _assert_minus1_1(x: torch.Tensor, *, name: str, tol: float = 1e-3) -> None:
+    x_min = float(x.detach().min().cpu())
+    x_max = float(x.detach().max().cpu())
+    if (x_min < -1.0 - tol) or (x_max > 1.0 + tol):
+        raise ValueError(
+            f"{name} expected in [-1,1] (got min={x_min:.4f}, max={x_max:.4f}). "
+            "This script assumes CIFAR-10 tensors are mapped from [0,1] to [-1,1] before VAE encoding."
+        )
 
 
 def load_vae(ckpt_path: str, device: torch.device) -> VAE:
@@ -142,13 +151,21 @@ def main() -> None:
     for x, y in tqdm(test_loader, desc="encode test"):
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+        _assert_minus1_1(x, name="CIFAR-10 test batch")
 
-        mu, _logvar = vae.encode(x)
-        z = mu.flatten(1)
+        with torch.no_grad():
+            mu, _logvar = vae.encode(x)
+            if not torch.isfinite(mu).all():
+                raise RuntimeError("Non-finite VAE encoder output (mu). Check input normalization and checkpoint.")
+            z = mu.flatten(1)
+
         zt = transport(z, y)
+        if not torch.isfinite(zt).all():
+            raise RuntimeError("Non-finite transport output (T(z,y)). Check transport checkpoint and inputs.")
 
-        logits_t = theta0(zt)
-        loss_t = F.cross_entropy(logits_t, y, reduction="none")  # (B,)
+        with torch.no_grad():
+            logits_t = theta0(zt)
+            loss_t = F.cross_entropy(logits_t, y, reduction="none")  # (B,)
 
         z_all.append(z.cpu())
         zt_all.append(zt.cpu())

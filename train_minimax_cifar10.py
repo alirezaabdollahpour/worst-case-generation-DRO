@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
+from wmg.data.cifar10 import cifar10_transform
 from wmg.models.vae import VAE, VAEConfig
 from wmg.models.classifier import MLPClassifier, ClassifierConfig
 from wmg.models.transport import LabelConditionedTransport, TransportConfig
@@ -88,10 +89,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def _normalize_to_minus1_1() -> transforms.Compose:
-    return transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda t: t * 2.0 - 1.0),
-    ])
+    # Keep a single canonical normalization across all scripts.
+    return cifar10_transform(normalize_to_minus1_1=True, augment=False)
+
+
+def _assert_minus1_1(x: torch.Tensor, *, name: str, tol: float = 1e-3) -> None:
+    x_min = float(x.detach().min().cpu())
+    x_max = float(x.detach().max().cpu())
+    if (x_min < -1.0 - tol) or (x_max > 1.0 + tol):
+        raise ValueError(
+            f"{name} expected in [-1,1] (got min={x_min:.4f}, max={x_max:.4f}). "
+            "This script assumes CIFAR-10 tensors are mapped from [0,1] to [-1,1] before VAE encoding."
+        )
 
 
 def load_vae(ckpt_path: str, device: torch.device) -> Tuple[VAE, Dict[str, Any]]:
@@ -129,7 +138,10 @@ def encode_subset_to_latents(
     labels: List[torch.Tensor] = []
     for x, y in subset_loader:
         x = x.to(device, non_blocking=True)
+        _assert_minus1_1(x, name="CIFAR-10 batch")
         mu, _logvar = vae.encode(x)       # (B,16,4,4)
+        if not torch.isfinite(mu).all():
+            raise RuntimeError("Non-finite VAE encoder output (mu). Check input normalization and checkpoint.")
         z = mu.flatten(1)                # (B,256)
         latents.append(z.cpu())
         labels.append(y.cpu())

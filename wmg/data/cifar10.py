@@ -26,6 +26,31 @@ def _normalize_transform(normalize_to_minus1_1: bool) -> transforms.Compose:
     return transforms.Lambda(lambda t: t)
 
 
+def cifar10_transform(
+    *,
+    normalize_to_minus1_1: bool = True,
+    augment: bool = False,
+    color_jitter: Tuple[float, float, float, float] = (0.2, 0.2, 0.2, 0.1),
+) -> transforms.Compose:
+    """Canonical CIFAR-10 preprocessing used across scripts.
+
+    - Converts PIL -> tensor in [0,1] via ToTensor().
+    - Optionally applies train-time augmentation (flip + color jitter) on PIL.
+    - Optionally maps [0,1] -> [-1,1] to match VAE training assumptions.
+    """
+    tfs = []
+    if augment:
+        tfs += [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(*color_jitter),
+        ]
+    tfs += [
+        transforms.ToTensor(),
+        _normalize_transform(normalize_to_minus1_1),
+    ]
+    return transforms.Compose(tfs)
+
+
 def make_cifar10_loaders(
     cfg: CIFAR10DataConfig,
     *,
@@ -33,17 +58,16 @@ def make_cifar10_loaders(
     augment: bool = False,
     shuffle: bool = True,
 ) -> DataLoader:
-    tfs = []
-    if augment:
-        tfs += [
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(*cfg.color_jitter),
-        ]
-    tfs += [
-        transforms.ToTensor(),
-        _normalize_transform(cfg.normalize_to_minus1_1),
-    ]
-    ds = datasets.CIFAR10(root=cfg.data_root, train=train, download=True, transform=transforms.Compose(tfs))
+    ds = datasets.CIFAR10(
+        root=cfg.data_root,
+        train=train,
+        download=True,
+        transform=cifar10_transform(
+            normalize_to_minus1_1=cfg.normalize_to_minus1_1,
+            augment=augment,
+            color_jitter=cfg.color_jitter,
+        ),
+    )
     loader = DataLoader(
         ds,
         batch_size=cfg.batch_size,
