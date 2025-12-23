@@ -179,12 +179,19 @@ def main() -> None:
     seed_everything(args.seed)
     out_dir = ensure_dir(args.out_dir)
     device = torch.device(args.device)
-    metrics_path = out_dir / args.metrics_file if args.metrics_file else None
+    metrics_path = None
+    if args.metrics_file:
+        mp = Path(args.metrics_file)
+        # If a bare filename is provided, write it inside out_dir. If the user
+        # provides a path (relative or absolute), respect it as-is.
+        metrics_path = (out_dir / mp) if (not mp.is_absolute() and mp.parent == Path(".")) else mp
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_rows: List[Dict[str, Any]] = []
 
     def _write_metrics() -> None:
         if metrics_path is None:
             return
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "args": vars(args),
             "metrics": metrics_rows,
