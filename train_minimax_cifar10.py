@@ -43,10 +43,33 @@ def parse_args() -> argparse.Namespace:
                   help="Weight decay ω inside ℓ_y(θ, x). Table A.2 uses 1e-3.")
 
     # Transport optimizer (Table A.2)
+    p.add_argument(
+        "--transport",
+        type=str,
+        default="mlp",
+        choices=["mlp", "icnn"],
+        help="Transport map parametrization: residual MLP (Appendix B.2) or ICNN potential (wmg/models/icnn.py).",
+    )
     p.add_argument("--transport_lr", type=float, default=1e-4)
     p.add_argument("--transport_wd", type=float, default=1e-5)
 
-    p.add_argument("--num_workers", type=int, default=4)
+    # ICNN transport hyperparameters / BB+Armijo step-size
+    p.add_argument("--icnn_hidden_sizes", type=str, default="512,512,512",
+                   help="Comma-separated ICNN hidden widths (e.g. '512,512,512').")
+    p.add_argument("--icnn_activation", type=str, default="softplus", choices=["softplus", "relu"])
+    p.add_argument("--icnn_strong_convexity", type=float, default=1.0)
+    p.add_argument("--icnn_nonneg_init", type=str, default="principled", choices=["principled", "xavier"])
+    p.add_argument("--icnn_softplus_beta", type=float, default=20.0)
+    p.add_argument("--icnn_no_identity_init", action="store_true",
+                   help="Disable identity-like initialization for ICNN transport.")
+    p.add_argument("--icnn_alpha0", type=float, default=1e-1)
+    p.add_argument("--icnn_alpha_min", type=float, default=1e-6)
+    p.add_argument("--icnn_alpha_max", type=float, default=10.0)
+    p.add_argument("--icnn_ls_c", type=float, default=1e-4)
+    p.add_argument("--icnn_ls_shrink", type=float, default=0.5)
+    p.add_argument("--icnn_ls_max_steps", type=int, default=10)
+
+    p.add_argument("--num_workers", type=int, default=1)
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--log_every", type=int, default=50)
     return p.parse_args()
@@ -114,6 +137,19 @@ def make_class_balanced_indices(targets: List[int], n_per_class: int, seed: int)
     return out
 
 
+def _parse_hidden_sizes(csv: str) -> Tuple[int, ...]:
+    parts = [p.strip() for p in csv.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("icnn_hidden_sizes must be a non-empty comma-separated list (e.g. '512,512,512').")
+    try:
+        sizes = tuple(int(p) for p in parts)
+    except ValueError as e:
+        raise ValueError(f"Invalid icnn_hidden_sizes='{csv}'. Expected comma-separated ints.") from e
+    if any(s <= 0 for s in sizes):
+        raise ValueError(f"Invalid icnn_hidden_sizes='{csv}'. All sizes must be positive.")
+    return sizes
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -153,9 +189,39 @@ def main() -> None:
     g = torch.zeros_like(v)
 
     # Transport map T_φ(x,y): residual MLP with label embedding; initialized as identity (Appendix B.2).
-    tcfg = TransportConfig(latent_dim=d, hidden_width=512, num_classes=10, label_embed_dim=512)
-    transport = LabelConditionedTransport(tcfg).to(device)
-    opt_transport = Adam(transport.parameters(), lr=args.transport_lr, weight_decay=args.transport_wd)
+    opt_transport = None
+    bb_state = None
+    if args.transport == "mlp":
+        tcfg = TransportConfig(latent_dim=d, hidden_width=512, num_classes=10, label_embed_dim=512)
+        transport = LabelConditionedTransport(tcfg).to(device)
+        opt_transport = Adam(transport.parameters(), lr=args.transport_lr, weight_decay=args.transport_wd)
+        transport_cfg_dict: Dict[str, Any] = tcfg.__dict__
+    else:
+        from wmg.models.icnn import LabelConditionedICNNTransport, ICNNTransportConfig
+        from wmg.utils.BB_Armijo import BBArmijoState, bb_armijo_step_params
+
+        hidden_sizes = _parse_hidden_sizes(args.icnn_hidden_sizes)
+        icfg = ICNNTransportConfig(
+            latent_dim=d,
+            hidden_sizes=hidden_sizes,
+            num_classes=10,
+            label_embed_dim=512,
+            activation=args.icnn_activation,
+            strong_convexity=args.icnn_strong_convexity,
+            nonneg_init=args.icnn_nonneg_init,
+            softplus_beta=args.icnn_softplus_beta,
+            identity_init=not args.icnn_no_identity_init,
+        )
+        transport = LabelConditionedICNNTransport(icfg).to(device)
+        bb_state = BBArmijoState.create(
+            alpha0=args.icnn_alpha0,
+            alpha_min=args.icnn_alpha_min,
+            alpha_max=args.icnn_alpha_max,
+            ls_c=args.icnn_ls_c,
+            ls_shrink=args.icnn_ls_shrink,
+            ls_max_steps=args.icnn_ls_max_steps,
+        )
+        transport_cfg_dict = {**icfg.__dict__, "hidden_sizes": list(icfg.hidden_sizes)}
 
     # Momentum buffers for θ: h^0 = 0.
     h_params = [torch.zeros_like(p) for p in theta.parameters()]
@@ -218,18 +284,42 @@ def main() -> None:
         y_s = y[idx_small]
         v_s = v[idx_small].detach()
 
-        pred = transport(x_s, y_s)
-        match_loss = ((pred - v_s) ** 2).mean()
+        match_loss_val: float
+        if args.transport == "mlp":
+            pred = transport(x_s, y_s)
+            match_loss = ((pred - v_s) ** 2).mean()
+            match_loss_val = float(match_loss.detach().cpu())
 
-        opt_transport.zero_grad(set_to_none=True)
-        match_loss.backward()
-        opt_transport.step()
+            assert opt_transport is not None
+            opt_transport.zero_grad(set_to_none=True)
+            match_loss.backward()
+            opt_transport.step()
+        else:
+            assert bb_state is not None
+            match_loss_val = float("nan")
+
+            def f_params(create_graph: bool) -> torch.Tensor:
+                nonlocal match_loss_val
+                pred = transport(x_s, y_s, create_graph=create_graph)  # type: ignore[misc]
+                mse = ((pred - v_s) ** 2).mean()
+                if create_graph and (match_loss_val != match_loss_val):  # NaN check
+                    match_loss_val = float(mse.detach().cpu())
+
+                obj = -mse
+                if args.transport_wd > 0:
+                    l2 = torch.zeros((), device=device)
+                    for p in transport.parameters():
+                        l2 = l2 + torch.sum(p ** 2)
+                    obj = obj - 0.5 * args.transport_wd * l2
+                return obj
+
+            _params, bb_state, _f0, _gn = bb_armijo_step_params(transport.parameters(), f_params, bb_state)
 
         # ---- Logging / checkpointing ----
         if (k % args.log_every) == 0 or k == 1:
             with torch.no_grad():
                 ce_mean = float(ce.mean().cpu())
-                m_loss = float(match_loss.cpu())
+                m_loss = float(match_loss_val)
                 # Gradient norm of averaged θ-gradient on this batch (optional diagnostic)
                 gn_theta = 0.0
                 for p in theta.parameters():
@@ -247,8 +337,10 @@ def main() -> None:
                 "classifier_cfg": clf_ckpt.get("clf_cfg", {}),
                 "theta_state": theta.state_dict(),
                 "theta0_state": theta0.state_dict(),
-                "transport_cfg": tcfg.__dict__,
+                "transport_type": str(args.transport),
+                "transport_cfg": transport_cfg_dict,
                 "transport_state": transport.state_dict(),
+                "transport_bb_state": bb_state,
                 "x": x.detach().cpu(),
                 "y": y.detach().cpu(),
                 "v": v.detach().cpu(),
@@ -264,8 +356,10 @@ def main() -> None:
         "classifier_cfg": clf_ckpt.get("clf_cfg", {}),
         "theta_state": theta.state_dict(),
         "theta0_state": theta0.state_dict(),
-        "transport_cfg": tcfg.__dict__,
+        "transport_type": str(args.transport),
+        "transport_cfg": transport_cfg_dict,
         "transport_state": transport.state_dict(),
+        "transport_bb_state": bb_state,
         "x": x.detach().cpu(),
         "y": y.detach().cpu(),
         "v": v.detach().cpu(),
