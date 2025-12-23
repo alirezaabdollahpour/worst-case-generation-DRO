@@ -57,7 +57,7 @@ def load_vae(ckpt_path: str, device: torch.device) -> VAE:
     return vae
 
 
-def load_theta0_and_transport(minimax_ckpt_path: str, device: torch.device) -> Tuple[MLPClassifier, LabelConditionedTransport]:
+def load_theta0_and_transport(minimax_ckpt_path: str, device: torch.device) -> Tuple[MLPClassifier, torch.nn.Module]:
     ckpt = load_checkpoint(minimax_ckpt_path, map_location=device)
 
     clf_cfg = ClassifierConfig(**ckpt.get("classifier_cfg", {"latent_dim": 256, "hidden_width": 512, "num_classes": 10}))
@@ -67,8 +67,36 @@ def load_theta0_and_transport(minimax_ckpt_path: str, device: torch.device) -> T
     for p in theta0.parameters():
         p.requires_grad_(False)
 
-    tcfg = TransportConfig(**ckpt["transport_cfg"])
-    transport = LabelConditionedTransport(tcfg).to(device)
+    tcfg_raw = ckpt.get("transport_cfg", {})
+    ttype = ckpt.get("transport_type", None)
+
+    # Backward/forward compatible transport selection:
+    # - New checkpoints store `transport_type` = {"mlp","icnn"}.
+    # - Older checkpoints only have the MLP config.
+    # - Some experimental checkpoints may include a `type` key in transport_cfg.
+    if ttype is None and isinstance(tcfg_raw, dict):
+        ttype = tcfg_raw.get("type", None)
+    if ttype is None:
+        ttype = "icnn" if (isinstance(tcfg_raw, dict) and ("hidden_sizes" in tcfg_raw)) else "mlp"
+
+    if isinstance(tcfg_raw, dict) and "type" in tcfg_raw:
+        tcfg_raw = {k: v for k, v in tcfg_raw.items() if k != "type"}
+
+    if ttype == "mlp":
+        tcfg = TransportConfig(**tcfg_raw)
+        transport = LabelConditionedTransport(tcfg).to(device)
+    elif ttype == "icnn":
+        from wmg.models.icnn import LabelConditionedICNNTransport, ICNNTransportConfig
+
+        if isinstance(tcfg_raw, dict) and ("hidden_sizes" in tcfg_raw):
+            hs = tcfg_raw["hidden_sizes"]
+            if isinstance(hs, list):
+                tcfg_raw = {**tcfg_raw, "hidden_sizes": tuple(hs)}
+        icfg = ICNNTransportConfig(**tcfg_raw)
+        transport = LabelConditionedICNNTransport(icfg).to(device)
+    else:
+        raise ValueError(f"Unknown transport_type='{ttype}' in checkpoint.")
+
     transport.load_state_dict(ckpt["transport_state"])
     transport.eval()
     for p in transport.parameters():
